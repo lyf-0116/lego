@@ -3,7 +3,9 @@ package certificate
 import (
 	"context"
 	"crypto"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -22,22 +24,27 @@ type RenewalInfo struct {
 }
 
 // ShouldRenewAt determines the optimal renewal time based on the current time (UTC),
-// renewal window suggest by ARI, and the client's willingness to sleep.
+// the renewal window suggested by ARI, and the client's willingness to sleep.
 // It returns a pointer to a time.Time value indicating when the renewal should be attempted or nil if deferred until the next normal wake time.
 // This method implements the RECOMMENDED algorithm described in RFC 9773.
 //
 // - (4.1-11. Getting Renewal Information) https://www.rfc-editor.org/rfc/rfc9773.html
-func (r *RenewalInfo) ShouldRenewAt(now time.Time, willingToSleep time.Duration) *time.Time {
+//
+// The point picked inside the window is deterministic: it is derived from the certificate serial number
+// and the start of the suggested window.
+// Repeated checks of the same certificate against the same window therefore return the same time,
+// while distinct certificates are spread across the window across the fleet,
+// and a sliding window (a different start time) yields a new point instead of repeatedly deferring the renewal.
+func (r *RenewalInfo) ShouldRenewAt(now time.Time, willingToSleep time.Duration, leaf *x509.Certificate) *time.Time {
 	// Explicitly convert all times to UTC.
 	now = now.UTC()
 	start := r.SuggestedWindow.Start.UTC()
 	end := r.SuggestedWindow.End.UTC()
 
-	// Select a uniform random time within the suggested window.
+	// Select a uniformly distributed time within the suggested window.
 	rt := start
 	if window := end.Sub(start); window > 0 {
-		randomDuration := time.Duration(rand.Int64N(int64(window)))
-		rt = rt.Add(randomDuration)
+		rt = rt.Add(deterministicWindowOffset(leaf, start, window))
 	}
 
 	// If the selected time is in the past, attempt renewal immediately.
@@ -55,6 +62,31 @@ func (r *RenewalInfo) ShouldRenewAt(now time.Time, willingToSleep time.Duration)
 
 	// Otherwise, sleep until the next normal wake time, re-check ARI, and return to Step 1.
 	return nil
+}
+
+// deterministicWindowOffset maps the certificate and the suggested window to an offset in [0, window).
+// The seed mixes the certificate serial number with the window start:
+// seeding on the serial number alone would make every window of the same certificate collapse onto the same
+// offset, so a point landing beyond the willingness to sleep could defer the renewal forever as checks repeat.
+// Mixing in the window start keeps the choice stable within one window while spreading both certificates
+// (different serial numbers) and successive, sliding windows (different starts) across the whole range.
+func deterministicWindowOffset(leaf *x509.Certificate, start time.Time, window time.Duration) time.Duration {
+	var serial string
+	if leaf != nil && leaf.SerialNumber != nil {
+		serial = leaf.SerialNumber.String()
+	}
+
+	h := sha256.New()
+	h.Write([]byte(serial))
+	h.Write([]byte(start.Format(time.RFC3339Nano)))
+
+	sum := h.Sum(nil)
+	rng := rand.New(rand.NewPCG(
+		binary.LittleEndian.Uint64(sum[0:8]),
+		binary.LittleEndian.Uint64(sum[8:16]),
+	))
+
+	return time.Duration(rng.Int64N(int64(window)))
 }
 
 // RenewOptions options used by [Certifier.Renew].
@@ -84,7 +116,9 @@ type RenewOptions struct {
 // The caller should attempt to renew the certificate at the time indicated by the RenewalInfo.ShouldRenewAt method.
 //
 // Note: this endpoint is part of a draft specification, not all ACME servers will implement it.
-// This method will return api.ErrNoARI if the server does not advertise a renewal info endpoint.
+// This method returns api.ErrNoARI if the server does not advertise a renewal info endpoint,
+// and api.ErrInvalidWindow if the server serves an invalid suggested window,
+// which is a transient failure that must be retried rather than treated as an unsupported endpoint.
 //
 // https://www.rfc-editor.org/rfc/rfc9773.html
 func (c *Certifier) GetRenewalInfo(ctx context.Context, cert *x509.Certificate) (*RenewalInfo, error) {

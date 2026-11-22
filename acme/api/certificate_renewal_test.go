@@ -1,10 +1,15 @@
 package api
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/asn1"
+	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"testing"
 	"time"
@@ -37,6 +42,81 @@ func TestMakeCertID(t *testing.T) {
 	actual, err := MakeARICertID(leaf)
 	require.NoError(t, err)
 	assert.Equal(t, ariLeafCertID, actual)
+}
+
+func TestMakeCertID_longSerialNumber(t *testing.T) {
+	// The DER encoding of these serial numbers uses the long-form length octets,
+	// so slicing the marshalled INTEGER at a fixed offset would include length bytes
+	// (or even the tag) in the base64url digest.
+	testCases := []struct {
+		desc   string
+		serial *big.Int
+	}{
+		{
+			desc:   "128 content bytes with leading zero padding",
+			serial: new(big.Int).SetBit(big.NewInt(0), 255, 1),
+		},
+		{
+			desc:   "128 content bytes without leading zero padding",
+			serial: new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1)),
+		},
+		{
+			desc:   "127 content bytes",
+			serial: new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 255), big.NewInt(1)),
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			leaf := generateARILeaf(t, test.serial)
+
+			actual, err := MakeARICertID(leaf)
+			require.NoError(t, err)
+
+			// Rebuild the expected identifier from the DER encoding by stripping the tag and every
+			// length octet, which is exactly what RFC 9773 section 4.1 prescribes.
+			der, err := asn1.Marshal(test.serial)
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, len(der), 3)
+
+			contentStart := 2
+			if der[1]&0x80 != 0 {
+				contentStart = 2 + int(der[1]&0x7f)
+			}
+
+			expectedSerial := base64.RawURLEncoding.EncodeToString(der[contentStart:])
+			expectedAKI := base64.RawURLEncoding.EncodeToString(leaf.AuthorityKeyId)
+
+			assert.Equal(t, expectedAKI+"."+expectedSerial, actual)
+
+			// The computed identifier must not contain any length octet of the long-form encoding.
+			assert.NotContains(t, actual, base64.RawURLEncoding.EncodeToString(der[1:contentStart]))
+		})
+	}
+}
+
+func generateARILeaf(t *testing.T, serial *big.Int) *x509.Certificate {
+	t.Helper()
+
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		DNSNames:     []string{"example.com"},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	require.NoError(t, err)
+
+	leaf, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+
+	return leaf
 }
 
 func TestCertificateService_GetRenewalInfo(t *testing.T) {
@@ -113,10 +193,11 @@ func TestCertificateService_GetRenewalInfo_errors(t *testing.T) {
 	require.NoError(t, err, "Could not generate test key")
 
 	testCases := []struct {
-		desc    string
-		timeout time.Duration
-		request string
-		handler http.HandlerFunc
+		desc        string
+		timeout     time.Duration
+		request     string
+		handler     http.HandlerFunc
+		expectedErr error
 	}{
 		{
 			desc:    "API timeout",
@@ -136,8 +217,9 @@ func TestCertificateService_GetRenewalInfo_errors(t *testing.T) {
 			},
 		},
 		{
-			desc:    "end before start",
-			request: mustMakeARICertID(t, leaf),
+			desc:        "end before start",
+			request:     mustMakeARICertID(t, leaf),
+			expectedErr: ErrInvalidWindow,
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				info := &acme.RenewalInfo{
 					SuggestedWindow: acme.Window{
@@ -171,6 +253,11 @@ func TestCertificateService_GetRenewalInfo_errors(t *testing.T) {
 			response, err := core.Certificates.GetRenewalInfo(t.Context(), test.request)
 			require.Error(t, err)
 			assert.Nil(t, response)
+
+			if test.expectedErr != nil {
+				assert.ErrorIs(t, err, test.expectedErr)
+				assert.NotErrorIs(t, err, ErrNoARI)
+			}
 		})
 	}
 }

@@ -280,6 +280,18 @@ func getARIRenewalTime(ctx context.Context, willingToSleep time.Duration, cert *
 			return nil
 		}
 
+		if errors.Is(err, api.ErrInvalidWindow) {
+			// The server served an invalid suggested window.
+			// Per RFC 9773 this is a transient failure: don't fall back permanently,
+			// let the normal renewal schedule run and retry ARI on the next invocation.
+			log.Warn("The renewal info endpoint served an invalid suggested window; retrying later.",
+				log.CertNameAttr(certID),
+				log.ErrorAttr(err),
+			)
+
+			return nil
+		}
+
 		log.Warn("Calling renewal info endpoint",
 			log.CertNameAttr(certID),
 			log.ErrorAttr(err),
@@ -290,7 +302,7 @@ func getARIRenewalTime(ctx context.Context, willingToSleep time.Duration, cert *
 
 	now := time.Now().UTC()
 
-	renewalTime := renewalInfo.ShouldRenewAt(now, willingToSleep)
+	renewalTime := renewalInfo.ShouldRenewAt(now, willingToSleep, cert)
 	if renewalTime == nil {
 		log.Debug("RenewalInfo endpoint indicates that renewal is not needed.", log.CertNameAttr(certID))
 		return nil
