@@ -42,10 +42,10 @@ func (c *Certifier) getAuthorizations(ctx context.Context, order acme.ExtendedOr
 		}
 	}
 
-	for i, auth := range order.Authorizations {
+	for _, authz := range responses {
 		log.Debug("Authorization",
-			slog.String("url", order.Identifiers[i].Value),
-			slog.String("authz", auth),
+			slog.String("identifier", authz.Identifier.Value),
+			slog.String("status", authz.Status),
 		)
 	}
 

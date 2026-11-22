@@ -98,7 +98,7 @@ func TestProber_Solve(t *testing.T) {
 			},
 			expectedError: `resolver: one or more domains had a problem: [example.com: preSolve error example.com]`,
 			expectedCounters: map[challenge.Type]string{
-				challenge.HTTP01: "PreSolve: 3, Solve: 2, CleanUp: 3",
+				challenge.HTTP01: "PreSolve: 3, Solve: 2, CleanUp: 2",
 			},
 		},
 		{
@@ -124,7 +124,7 @@ func TestProber_Solve(t *testing.T) {
 			},
 			expectedError: `resolver: one or more domains had a problem: [example.com: preSolve error example.com] [example.org: solve error example.org]`,
 			expectedCounters: map[challenge.Type]string{
-				challenge.HTTP01: "PreSolve: 3, Solve: 2, CleanUp: 3",
+				challenge.HTTP01: "PreSolve: 3, Solve: 2, CleanUp: 2",
 			},
 		},
 	}

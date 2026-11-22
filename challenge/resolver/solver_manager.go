@@ -96,6 +96,13 @@ func (c *SolverManager) ResetSolvers() {
 
 // Checks all challenges from the server in order and returns the first matching solver.
 func (c *SolverManager) chooseSolver(authz acme.Authorization) solver {
+	solvr, _ := c.chooseSolverAndChallenge(authz)
+
+	return solvr
+}
+
+// chooseSolverAndChallenge returns the first matching solver and its challenge.
+func (c *SolverManager) chooseSolverAndChallenge(authz acme.Authorization) (solver, acme.Challenge) {
 	// Allow having a deterministic challenge order
 	sort.Sort(byType(authz.Challenges))
 
@@ -104,7 +111,7 @@ func (c *SolverManager) chooseSolver(authz acme.Authorization) solver {
 	for _, chlg := range authz.Challenges {
 		if solvr, ok := c.solvers[challenge.Type(chlg.Type)]; ok {
 			log.Info("Use solver.", log.DomainAttr(domain), slog.String("type", chlg.Type))
-			return solvr
+			return solvr, chlg
 		}
 
 		log.Debug("The challenge type is not in the list of available solvers. Skipping.",
@@ -119,7 +126,7 @@ func (c *SolverManager) chooseSolver(authz acme.Authorization) solver {
 		slog.String("solvers", solversToString(c.solvers)),
 	)
 
-	return nil
+	return nil, acme.Challenge{}
 }
 
 func validate(ctx context.Context, core *api.Core, domain string, chlg acme.Challenge) error {
