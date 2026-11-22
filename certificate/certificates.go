@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/go-acme/lego/v5/acme"
@@ -50,7 +51,12 @@ type Resource struct {
 	KeyType certcrypto.KeyType `json:"keyType"`
 
 	PreferredChain string `json:"preferredChain,omitempty"`
-	Profile        string `json:"profile,omitempty"`
+	// PreferredChainMatched reports whether a chain returned by the CA matched
+	// PreferredChain. It is only meaningful when PreferredChain is not empty:
+	// true means an alternate chain was selected, false means no chain matched
+	// and the default certificate chain was used instead.
+	PreferredChainMatched bool   `json:"preferredChainMatched,omitempty"`
+	Profile               string `json:"profile,omitempty"`
 
 	CertURL       string `json:"certUrl"`
 	CertStableURL string `json:"certStableUrl"`
@@ -475,25 +481,62 @@ func (c *Certifier) checkResponse(ctx context.Context, certRes *Resource, order 
 		return true, nil
 	}
 
-	for link, cert := range certs {
-		ok, err := hasPreferredChain(cert.Issuer, preferredChain)
-		if err != nil {
-			return false, err
+	// The default certificate chain is always evaluated first: it is the
+	// reference the alternate chains must be bound to, and keeping it first
+	// also makes the selection deterministic instead of relying on map order.
+	defaultCert := certs[order.Certificate]
+
+	defaultChain, err := parseCertificateChain(defaultCert)
+	if err != nil {
+		return false, err
+	}
+
+	leaf := defaultChain[0]
+
+	if isPreferredChain(leaf, defaultChain, preferredChain) {
+		certRes.PreferredChainMatched = true
+
+		log.Info("Server responded with a certificate.",
+			log.DomainsAttr(certRes.Domains),
+			slog.String("preferredChain", preferredChain),
+		)
+
+		return true, nil
+	}
+
+	links := make([]string, 0, len(certs)-1)
+	for link := range certs {
+		if link != order.Certificate {
+			links = append(links, link)
+		}
+	}
+
+	sort.Strings(links)
+
+	for _, link := range links {
+		cert := certs[link]
+
+		chain, errP := parseCertificateChain(cert)
+		if errP != nil {
+			return false, errP
 		}
 
-		if ok {
-			log.Info("Server responded with a certificate.",
-				log.DomainsAttr(certRes.Domains),
-				slog.String("preferredChain", preferredChain),
-			)
-
-			certRes.IssuerCertificate = cert.Issuer
-			certRes.Certificate = cert.Cert
-			certRes.CertURL = link
-			certRes.CertStableURL = link
-
-			return true, nil
+		if !isPreferredChain(leaf, chain, preferredChain) {
+			continue
 		}
+
+		log.Info("Server responded with a certificate.",
+			log.DomainsAttr(certRes.Domains),
+			slog.String("preferredChain", preferredChain),
+		)
+
+		certRes.IssuerCertificate = cert.Issuer
+		certRes.Certificate = cert.Cert
+		certRes.CertURL = link
+		certRes.CertStableURL = link
+		certRes.PreferredChainMatched = true
+
+		return true, nil
 	}
 
 	log.Warn("lego has been configured to prefer certificate chains with issuer, but no chain from the CA matched this issuer. Using the default certificate chain instead.",
@@ -653,19 +696,80 @@ func (c *Certifier) Get(ctx context.Context, url string, bundle bool) (*Resource
 	}, nil
 }
 
-func hasPreferredChain(issuer []byte, preferredChain string) (bool, error) {
-	certs, err := certcrypto.ParsePEMBundle(issuer)
+// parseCertificateChain reconstructs the certificate chain of a CA response.
+// The leaf always comes from the certificate part, while the issuer part
+// contains the remaining certificates (intermediates and root). When the
+// response is bundled, the certificate part already contains the full chain.
+func parseCertificateChain(raw *acme.RawCertificate) ([]*x509.Certificate, error) {
+	certs, err := certcrypto.ParsePEMBundle(raw.Cert)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
-	topCert := certs[len(certs)-1]
-
-	if topCert.Issuer.CommonName == preferredChain {
-		return true, nil
+	if len(raw.Issuer) == 0 {
+		return certs, nil
 	}
 
-	return false, nil
+	issuerCerts, err := certcrypto.ParsePEMBundle(raw.Issuer)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(certs[:1:1], issuerCerts...), nil
+}
+
+// isPreferredChain checks that an issuer chain can be selected as the
+// preferred chain of the leaf certificate.
+//
+// The checks are intentionally name based and lenient:
+//   - the alternate chain must start with the exact same leaf certificate as
+//     the default chain, so an alternate response can never replace the
+//     issued certificate;
+//   - every certificate must be signed for the previous one (issuer name of
+//     a certificate equals the subject name of the next one), so a response
+//     made of unrelated certificates cannot be selected;
+//   - the issuer common name of the topmost certificate must equal the
+//     configured preferred chain name.
+//
+// Malformed or unbound chains are simply skipped instead of raising an error:
+// real CAs can return incomplete chains or unusual cross-signing orders, and
+// a failed preference must never prevent certificate issuance.
+func isPreferredChain(leaf *x509.Certificate, chain []*x509.Certificate, preferredChain string) bool {
+	if !isSameCertificate(leaf, chain[0]) {
+		return false
+	}
+
+	if !isOrderedChain(chain) {
+		return false
+	}
+
+	return chain[len(chain)-1].Issuer.CommonName == preferredChain
+}
+
+// isSameCertificate compares two certificates through their raw DER bytes,
+// which is the canonical representation parsed by x509.ParseCertificate.
+func isSameCertificate(left, right *x509.Certificate) bool {
+	return bytes.Equal(left.Raw, right.Raw)
+}
+
+// isOrderedChain verifies that the certificates are ordered from the leaf to
+// the trust anchor, each one being issued by the next one. A self-signed
+// topmost certificate (a root) is a valid chain ending.
+func isOrderedChain(certs []*x509.Certificate) bool {
+	for i := 0; i+1 < len(certs); i++ {
+		if !isIssuerOf(certs[i+1], certs[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// isIssuerOf reports whether parent has the subject name that issued child.
+// Only the distinguished names are compared: incomplete or cross-signed
+// chains may not provide a signature path to a locally trusted root.
+func isIssuerOf(parent, child *x509.Certificate) bool {
+	return child.Issuer.String() == parent.Subject.String()
 }
 
 func checkOrderStatus(order acme.ExtendedOrder) (bool, error) {
